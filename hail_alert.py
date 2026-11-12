@@ -149,53 +149,7 @@ def fmt(value, suffix="", digits=0):
     except (TypeError, ValueError):
         return "غير متاح"
 
-def main():
-    response = get_json(build_url())
-    # Open-Meteo returns one object per coordinate when multiple coordinates are requested.
-    datasets = response if isinstance(response, list) else [response]
-    now = datetime.now(LOCAL_TZ).replace(minute=0, second=0, microsecond=0)
-    end = now + timedelta(hours=FORECAST_HOURS)
-    events = []
-
-    for point_index, dataset in enumerate(datasets[:len(POINTS)]):
-        hourly = dataset.get("hourly", {})
-        times = hourly.get("time", [])
-        for i, time_text in enumerate(times):
-            try:
-                event_time = datetime.fromisoformat(time_text).replace(tzinfo=LOCAL_TZ)
-            except (TypeError, ValueError):
-                continue
-            if event_time < now or event_time > end:
-                continue
-            assessment = assess(hourly, i, POINTS[point_index][0])
-            if assessment:
-                assessment["time"] = event_time
-                events.append(assessment)
-
-    if not events:
-        print(f"No qualifying forecast signal in next {FORECAST_HOURS} hours.")
-        return
-
-    # Group points by the same forecast hour; select the strongest signal.
-    # Prioritize risk level, then the nearest forecast time.
-    events.sort(key=lambda e: (-e["level"], e["time"]))
-    event = events[0]
-    same_hour = [e for e in events if e["time"] == event["time"]]
-    strongest = max(same_hour, key=lambda e: e["level"])
-    affected = list(dict.fromkeys(e["point"] for e in same_hour))
-    event = strongest
-
-    event_key = event["time"].strftime("%Y-%m-%dT%H:00")
-    state = load_state()
-    sent = state.get("last_alerts", {})
-    if not isinstance(sent, dict):
-        sent = {}
-
-    previous_level = int(sent.get(event_key, 0) or 0)
-    if previous_level >= event["level"]:
-        print(f"Duplicate or lower-level alert suppressed: {event_key}")
-        return
-
+def build_message(event, affected, now, urgent=False):
     remaining = max(0, int((event["time"] - now).total_seconds() // 60))
     if event["level"] == 3:
         recommendation = "انقل السيارة فوراً إلى مكان مسقوف إن أمكن، وتابع التنبيهات الرسمية."
@@ -218,8 +172,9 @@ def main():
         if event["freezing"] is not None else ""
     )
 
+    heading = "🚨 تنبيه فوري – إشارة توقعات بَرَد" if urgent else "🕐 التقرير الجوي الدوري للدوادمي"
     message = (
-        "🌩️ تنبيه طقس للدوادمي\n\n"
+        f"{heading}\n\n"
         f'{event["title"]}\n'
         f'وقت الحالة المتوقع: {event["time"].strftime("%Y-%m-%d %H:%M")} (توقيت الرياض)\n'
         f'الوقت المتبقي حسب التوقع: نحو {remaining} دقيقة\n\n'
@@ -243,19 +198,99 @@ def main():
         "هذه قراءة توقعات عددية من Open-Meteo لعدة نقاط حول الدوادمي، وليست راداراً مباشراً. "
         "لا يمكن منها تحديد موقع خلية العاصفة الفعلي أو اتجاه حركتها أو سرعة اقترابها، "
         "ولا تمثل نسبة احتمال البَرَد. رمز الطقس 96/99 يشير إلى توقع عاصفة مع بَرَد "
-        "ولا يثبت وصول البَرَد إلى الأرض. لا تعتمد على مهلة الوصول وحدها؛ تابع تنبيهات "
-        "المركز الوطني للأرصاد والرصد المحلي."
+        "ولا يثبت وصول البَرَد إلى الأرض. تابع تنبيهات المركز الوطني للأرصاد والرصد المحلي."
+    )
+    return message
+
+
+def main():
+    response = get_json(build_url())
+    # Open-Meteo returns one object per coordinate when multiple coordinates are requested.
+    datasets = response if isinstance(response, list) else [response]
+    now = datetime.now(LOCAL_TZ).replace(minute=0, second=0, microsecond=0)
+    actual_now = datetime.now(LOCAL_TZ)
+    end = now + timedelta(hours=FORECAST_HOURS)
+    events = []
+
+    for point_index, dataset in enumerate(datasets[:len(POINTS)]):
+        hourly = dataset.get("hourly", {})
+        times = hourly.get("time", [])
+        for i, time_text in enumerate(times):
+            try:
+                event_time = datetime.fromisoformat(time_text).replace(tzinfo=LOCAL_TZ)
+            except (TypeError, ValueError):
+                continue
+            if event_time < now or event_time > end:
+                continue
+            assessment = assess(hourly, i, POINTS[point_index][0])
+            if assessment:
+                assessment["time"] = event_time
+                events.append(assessment)
+
+    if not events:
+        print(f"No qualifying forecast signal in next {FORECAST_HOURS} hours; no Telegram report sent.")
+        return
+
+    # Choose the strongest forecast hour and combine all affected grid points for that hour.
+    events.sort(key=lambda e: (-e["level"], e["time"]))
+    event = events[0]
+    same_hour = [e for e in events if e["time"] == event["time"]]
+    event = max(same_hour, key=lambda e: e["level"])
+    affected = list(dict.fromkeys(e["point"] for e in same_hour))
+
+    state = load_state()
+    sent = state.get("last_alerts", {})
+    if not isinstance(sent, dict):
+        sent = {}
+
+    # Hourly report: send at most once per Riyadh clock hour, but only when
+    # at least one qualifying weather signal exists.
+    hour_key = actual_now.strftime("%Y-%m-%dT%H:00")
+    hourly_due = state.get("last_hourly_report") != hour_key
+
+    # Immediate hail warning: do not let an earlier hourly report or an earlier
+    # alert for the same forecast hour suppress it. Repeat at most every 15 min
+    # while a level-3 hail signal remains present to avoid a message every 5 min.
+    last_urgent_text = state.get("last_urgent_sent_at")
+    try:
+        last_urgent = datetime.fromisoformat(last_urgent_text) if last_urgent_text else None
+    except (TypeError, ValueError):
+        last_urgent = None
+    event_key = event["time"].strftime("%Y-%m-%dT%H:00")
+    urgent_due = (
+        event["level"] == 3
+        and (
+            state.get("last_urgent_event_key") != event_key
+            or last_urgent is None
+            or (actual_now - last_urgent).total_seconds() >= 15 * 60
+        )
     )
 
+    if not hourly_due and not urgent_due:
+        print("No new hourly report or immediate hail warning is due.")
+        return
+
+    # If both are due, one immediate warning serves as this hour's report too.
+    message = build_message(event, affected, actual_now, urgent=urgent_due)
     send_telegram(message)
-    sent[event_key] = event["level"]
-    # Keep state compact (last 72 forecast-hour keys).
+
+    if hourly_due:
+        state["last_hourly_report"] = hour_key
+    if urgent_due:
+        state["last_urgent_sent_at"] = actual_now.isoformat(timespec="seconds")
+        state["last_urgent_event_key"] = event_key
+        sent[event_key] = max(int(sent.get(event_key, 0) or 0), event["level"])
+        state["last_alert_key"] = f'{event_key}:LEVEL_{event["level"]}'
+
+    state["last_alerts"] = sent
+    # Keep the legacy forecast-hour history compact.
     for old_key in sorted(sent)[:-72]:
         sent.pop(old_key, None)
-    state["last_alerts"] = sent
-    state["last_alert_key"] = f'{event_key}:LEVEL_{event["level"]}'
     save_state(state)
-    print(f'Alert sent: {event_key}, level={event["level"]}, points={len(affected)}')
+    print(
+        f"Telegram message sent: level={event['level']}, "
+        f"hourly_due={hourly_due}, urgent_due={urgent_due}, points={len(affected)}"
+    )
 
 if __name__ == "__main__":
     main()
